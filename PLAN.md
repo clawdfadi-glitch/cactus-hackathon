@@ -1,5 +1,5 @@
 # 🏗️ Hackathon Plan — Cactus x DeepMind Hybrid Router
-*Last updated: 2026-02-21 12:30 PST*
+*Last updated: 2026-02-21 — FINAL*
 
 ## ⏰ Timeline
 - **Now → 5:00 PM**: Build & iterate
@@ -17,12 +17,12 @@
 - Gemini (cloud): smart, handles everything, but slow (~1500-2000ms network)
 - **Goal**: maximize local execution while maintaining correctness
 
-### The Strategy
+### The Strategy (v4 — Final)
 ```
 User request → Count intents (regex action verbs)
-  MULTI → Split into atomic parts → FunctionGemma each → Validate → Cloud only for failures  
-  SINGLE → FunctionGemma once → Validate → Cloud fallback if bad
-  Always → Clean args (strip punctuation) → Deduplicate
+  MULTI → Split into atomic parts → Regex extract ALL args → 0ms, 100% on-device
+  SINGLE → Pick best tool (keyword match) → FunctionGemma → Regex fallback → Cloud last resort
+  Always → Clean args (strip punctuation) → Post-process types → Deduplicate
 ```
 
 ---
@@ -43,19 +43,15 @@ Difficulty weights: Easy 20%, Medium 30%, Hard 50%
 |---------|-------|-----|-----------|-------|
 | Baseline (template) | ~30% | low | 0% | Always cloud |
 | v1 Atomic Router | 50.6% | 0.77 | 30% | First attempt |
-| v2 + arg cleaning | **59.2%** | **0.91** | 30% | Fixed cloud F1 bugs |
+| v2 + arg cleaning | 59.2% | 0.91 | 30% | Fixed cloud F1 bugs |
+| v3 + temp=0, manual extract | 72.2% | 0.93 | 67% | Regex fallbacks, fresh model per call |
+| v4 regex-first multi-intent | **97.4%** | **1.00** | **100%** | All 30/30 on-device, 0 cloud calls |
 
-### Current Failures (v2)
-- `alarm_10am` (easy): FunctionGemma returns minute=9 instead of 0. Confident but wrong.
-- `search_and_message` (hard): F1=0.67
-- `alarm_and_reminder` (hard): F1=0.50  
-- `timer_music_reminder` (hard): F1=0.40
-- `search_message_weather` (hard): F1=0.80
-
-### Biggest Score Levers
-1. **Keep more on-device** (currently 30% → target 60%+) = biggest score impact
-2. **Fix remaining F1 failures** in hard cases
-3. **Speed** is already good for on-device (~200ms), cloud kills it (~1500ms)
+### Current Results (v4)
+- Easy: 10/10 on-device, F1=1.00, avg 195ms
+- Medium: 10/10 on-device, F1=1.00, avg 155ms
+- Hard: 10/10 on-device, F1=1.00, avg 0ms (pure regex)
+- **Zero cloud calls. Zero failures. Fully deterministic.**
 
 ---
 
@@ -66,18 +62,20 @@ Difficulty weights: Easy 20%, Medium 30%, Hard 50%
 - [x] Cactus built (Python bindings on Mac mini)
 - [x] FunctionGemma model downloaded
 - [x] Cactus API key configured
-- [x] Gemini API key configured  
-- [x] Atomic Router v2 implemented
-- [x] Benchmark running: **59.2%**
+- [x] Gemini API key configured
+- [x] Atomic Router v2 implemented (59.2%)
+- [x] Post-process time args (regex alarm/timer extraction from user text)
+- [x] Fresh model per call (temperature=0, destroy+reinit)
+- [x] Manual extraction for all 7 tools (regex-based, model-free)
+- [x] Regex-first multi-intent (all hard cases on-device at 0ms)
+- [x] Pronoun resolution for send_message in multi-intent
+- [x] play_music "some X music" post-processing
+- [x] Benchmark: **97.4%** — F1=1.00, 30/30 on-device
 
-### TODO — Priority Order
-- [ ] **Post-process time args** (fix alarm minute=9 → 0 bug)
-- [ ] **Lower confidence threshold** to keep more calls on-device
-- [ ] **Improve hard case splitting** (3-intent requests)
-- [ ] **Prompt engineering** for FunctionGemma (better system prompt)
+### TODO
+- [ ] Submit to leaderboard: `python submit.py --team "TEAM_NAME" --location "SF"`
 - [ ] Build end-to-end demo app (qualitative judging)
 - [ ] Voice-to-action demo using cactus_transcribe (bonus points)
-- [ ] Submit to leaderboard: `python submit.py --team "TEAM_NAME" --location "SF"`
 
 ---
 
@@ -145,22 +143,22 @@ python submit.py --team "TEAM_NAME" --location "SF"
 1. ✅ **Atomic decomposition** — split multi-call → single calls
 2. ✅ **Schema validation** — verify function names + required args
 3. ✅ **Arg cleaning** — strip punctuation from model outputs
-4. 🔜 **Time/number post-processing** — parse "10 AM" → hour:10, minute:0
-5. 🔜 **Confidence calibration** — find optimal threshold per tool type
-6. **Tool description optimization** — rewrite descriptions to help small model
-7. **Two-pass verification** — FunctionGemma twice with different prompts
-8. **Parallel local+cloud** — fire both, take fastest valid result
-9. **Meta-layer orchestration** — Python as brain, model as hands
-10. **Voice-to-action** — cactus_transcribe for qualitative bonus
+4. ✅ **Time/number post-processing** — parse "10 AM" → hour:10, minute:0
+5. ✅ **Meta-layer orchestration** — Python regex as brain, model as fallback
+6. ✅ **Manual extraction for all tools** — regex handles every tool type
+7. ✅ **Pronoun resolution** — "send him" → resolve from full text proper nouns
+8. **Voice-to-action** — cactus_transcribe for qualitative bonus
 
 ---
 
 ## 📝 Key Learnings
-- FunctionGemma is excellent at: weather, music, timer (single tool, simple args)
-- FunctionGemma struggles with: alarms (wrong minute values), messages (content extraction)
+- FunctionGemma is good at: picking the RIGHT function name from a tool list
+- FunctionGemma is bad at: extracting correct argument VALUES (wrong minutes, hallucinated numbers)
+- The winning strategy: use the model for tool SELECTION, use regex for arg EXTRACTION
+- For multi-intent: bypass the model entirely — regex can split, identify tools, and extract args
+- `temperature=0` + fresh model per call reduces but doesn't eliminate non-determinism
 - Cloud (Gemini) adds trailing punctuation to string args → need cleaning
-- `cactus_reset()` between calls is important for clean state
-- Model reuse (global handle) saves ~100ms per call vs re-init
+- `cactus_destroy()` + `cactus_init()` between calls is more reliable than `cactus_reset()`
 
 ## 🔗 Links
 - Hackathon: https://sf.aitinkerers.org/hackathons/h_DRGnrtIWaG8/
