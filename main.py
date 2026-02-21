@@ -3,7 +3,7 @@ sys.path.insert(0, "cactus/python/src")
 functiongemma_path = "cactus/weights/functiongemma-270m-it"
 
 import json, os, re, time
-from cactus import cactus_init, cactus_complete, cactus_destroy
+from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_reset
 from google import genai
 from google.genai import types
 
@@ -18,15 +18,41 @@ def _get_model():
     return _model
 
 
+def _clean_arg(value):
+    """Clean argument values: strip trailing punctuation, normalize whitespace."""
+    if isinstance(value, str):
+        # Strip trailing punctuation that models add but benchmarks don't expect
+        value = value.strip().rstrip('.!,;:')
+        # Normalize whitespace
+        value = ' '.join(value.split())
+    return value
+
+
+def _clean_calls(calls):
+    """Clean all argument values in function calls."""
+    cleaned = []
+    for call in calls:
+        clean_call = {"name": call["name"]}
+        if "arguments" in call:
+            clean_call["arguments"] = {
+                k: _clean_arg(v) for k, v in call["arguments"].items()
+            }
+        else:
+            clean_call["arguments"] = {}
+        cleaned.append(clean_call)
+    return cleaned
+
+
 def _cactus_call(messages, tools, force_tools=True):
     """Single FunctionGemma call — reuses model handle."""
     model = _get_model()
+    cactus_reset(model)  # Clear KV cache between calls
 
     cactus_tools = [{"type": "function", "function": t} for t in tools]
 
     raw_str = cactus_complete(
         model,
-        [{"role": "system", "content": "You are a helpful assistant that can use tools."}] + messages,
+        [{"role": "system", "content": "You are a helpful assistant that can use tools. Call the most appropriate tool for the user's request."}] + messages,
         tools=cactus_tools,
         force_tools=force_tools,
         max_tokens=256,
@@ -99,38 +125,47 @@ def generate_cloud(messages, tools):
     }
 
 
-# ── Atomic Router: the hybrid strategy ────────────────────────────────
+# ── Atomic Router v2 ─────────────────────────────────────────────────
 
-def _is_multi_call(text):
-    """Heuristic: detect if user wants multiple actions.
-    
-    Looks for conjunctions joining action phrases.
-    """
-    # Patterns that strongly suggest multiple intents
-    multi_patterns = [
-        r'\band\b.*\b(set|send|text|check|get|play|find|look|remind|create)\b',
-        r'\b(set|send|text|check|get|play|find|look|remind|create)\b.*\band\b.*\b(set|send|text|check|get|play|find|look|remind|create)\b',
+def _count_intents(text):
+    """Count likely number of tool-call intents in user text."""
+    # Action verbs that map to tools
+    action_patterns = [
+        r'\b(set\s+(an?\s+)?alarm)\b',
+        r'\b(set\s+(a\s+)?timer)\b',
+        r'\b(send|text)\s+\w+',
+        r'\b(check|get|what\'?s?)\s+(the\s+)?weather\b',
+        r'\b(play)\s+',
+        r'\b(remind|create\s+a?\s*reminder)\b',
+        r'\b(find|look\s+up|search)\b',
     ]
-    for p in multi_patterns:
+    count = 0
+    for p in action_patterns:
         if re.search(p, text, re.IGNORECASE):
-            return True
-    return False
+            count += 1
+    return max(count, 1)
 
 
 def _split_into_atomic(text):
     """Split a multi-intent request into atomic sub-requests.
     
-    Uses simple conjunction splitting + cleanup.
+    Handles patterns like:
+    - "Do X and do Y"
+    - "Do X, do Y, and do Z"  
+    - "Do X and also Y"
     """
-    # Split on ", and ", " and " but be smart about it
-    # First try splitting on ", and "
-    parts = re.split(r',?\s+and\s+', text, flags=re.IGNORECASE)
+    # Split on ", and ", " and ", ","
+    # But avoid splitting "Bohemian Rhapsody and ..." style
+    parts = re.split(r'(?:,\s*and\s+|,\s+and\s+|\s+and\s+(?=\w+\s+(?:the|a|an|my|me|to|for|in)\s))', text, flags=re.IGNORECASE)
     
-    # Clean up each part
+    if len(parts) == 1:
+        # Try splitting on just ", " for "Do X, check Y" patterns
+        parts = re.split(r',\s+(?=[a-z])', text, flags=re.IGNORECASE)
+    
     cleaned = []
     for part in parts:
         part = part.strip().rstrip('.')
-        if len(part) > 5:  # skip fragments
+        if len(part) > 3:
             cleaned.append(part)
     
     return cleaned if len(cleaned) > 1 else [text]
@@ -143,16 +178,13 @@ def _validate_call(call, tools):
     if call.get("name") not in tool_names:
         return False
     
-    # Find the matching tool
     tool = next(t for t in tools if t["name"] == call["name"])
     required = tool["parameters"].get("required", [])
     args = call.get("arguments", {})
     
-    # Check required args are present
     for req in required:
         if req not in args:
             return False
-        # Check for empty values
         if isinstance(args[req], str) and not args[req].strip():
             return False
     
@@ -160,14 +192,14 @@ def _validate_call(call, tools):
 
 
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
-    """Atomic Router: decompose → local-first → validate → fallback.
+    """Atomic Router v2: decompose → local-first → validate → selective cloud fallback.
     
     Strategy:
-    1. Detect multi-call requests and split into atomic sub-requests
-    2. Run FunctionGemma on each atomic request independently
-    3. Validate results (correct function name, required args present)
-    4. Only fall back to cloud for failed/invalid atomic calls
-    5. Merge all results
+    1. Count intents in user message
+    2. Single intent: try FunctionGemma → validate → cloud fallback if needed
+    3. Multi intent: split into atomic parts → FunctionGemma each → cloud for failures
+    4. Clean all argument values (strip trailing punctuation etc)
+    5. Deduplicate results
     """
     user_text = ""
     for m in messages:
@@ -177,44 +209,53 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     total_time = 0
     all_calls = []
     used_cloud = False
+    intent_count = _count_intents(user_text)
     
-    if _is_multi_call(user_text):
-        # ── MULTI-CALL PATH: Atomic decomposition ──
+    if intent_count >= 2:
+        # ── MULTI-CALL PATH ──
         atomic_parts = _split_into_atomic(user_text)
         
-        for part in atomic_parts:
-            sub_messages = [{"role": "user", "content": part}]
-            local = _cactus_call(sub_messages, tools)
-            total_time += local["total_time_ms"]
-            
-            # Validate local result
-            valid_calls = [c for c in local["function_calls"] if _validate_call(c, tools)]
-            
-            if valid_calls and local["confidence"] >= 0.3:
-                all_calls.extend(valid_calls)
-            else:
-                # Fallback to cloud for this atomic part only
-                cloud = generate_cloud(sub_messages, tools)
-                total_time += cloud["total_time_ms"]
-                all_calls.extend(cloud["function_calls"])
-                used_cloud = True
+        # If splitting failed but we detected multiple intents, send whole thing to cloud
+        if len(atomic_parts) < 2:
+            cloud = generate_cloud(messages, tools)
+            total_time += cloud["total_time_ms"]
+            all_calls = cloud["function_calls"]
+            used_cloud = True
+        else:
+            for part in atomic_parts:
+                sub_messages = [{"role": "user", "content": part}]
+                local = _cactus_call(sub_messages, tools)
+                total_time += local["total_time_ms"]
+                
+                valid_calls = [c for c in local["function_calls"] if _validate_call(c, tools)]
+                
+                if valid_calls and local["confidence"] >= 0.4:
+                    all_calls.extend(valid_calls)
+                else:
+                    # Cloud fallback for this sub-request
+                    cloud = generate_cloud(sub_messages, tools)
+                    total_time += cloud["total_time_ms"]
+                    all_calls.extend(cloud["function_calls"])
+                    used_cloud = True
     else:
-        # ── SINGLE-CALL PATH: Try local first ──
+        # ── SINGLE-CALL PATH ──
         local = _cactus_call(messages, tools)
         total_time += local["total_time_ms"]
         
         valid_calls = [c for c in local["function_calls"] if _validate_call(c, tools)]
         
-        if valid_calls and local["confidence"] >= 0.3:
+        if valid_calls and local["confidence"] >= 0.4:
             all_calls = valid_calls
         else:
-            # Fallback to cloud
             cloud = generate_cloud(messages, tools)
             total_time += cloud["total_time_ms"]
             all_calls = cloud["function_calls"]
             used_cloud = True
     
-    # Deduplicate calls (same function + same args = keep one)
+    # Clean all argument values
+    all_calls = _clean_calls(all_calls)
+    
+    # Deduplicate
     seen = set()
     deduped = []
     for call in all_calls:
@@ -246,8 +287,6 @@ def print_result(label, result):
         print(f"Arguments: {json.dumps(call['arguments'], indent=2)}")
 
 
-############## Example usage ##############
-
 if __name__ == "__main__":
     tools = [{
         "name": "get_weather",
@@ -255,24 +294,13 @@ if __name__ == "__main__":
         "parameters": {
             "type": "object",
             "properties": {
-                "location": {
-                    "type": "string",
-                    "description": "City name",
-                }
+                "location": {"type": "string", "description": "City name"}
             },
             "required": ["location"],
         },
     }]
 
-    messages = [
-        {"role": "user", "content": "What is the weather in San Francisco?"}
-    ]
-
-    on_device = generate_cactus(messages, tools)
-    print_result("FunctionGemma (On-Device Cactus)", on_device)
-
-    cloud = generate_cloud(messages, tools)
-    print_result("Gemini (Cloud)", cloud)
+    messages = [{"role": "user", "content": "What is the weather in San Francisco?"}]
 
     hybrid = generate_hybrid(messages, tools)
-    print_result("Hybrid Atomic Router", hybrid)
+    print_result("Hybrid Atomic Router v2", hybrid)
