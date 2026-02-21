@@ -1,48 +1,53 @@
-
 import sys
 sys.path.insert(0, "cactus/python/src")
 functiongemma_path = "cactus/weights/functiongemma-270m-it"
 
-import json, os, time
+import json, os, re, time
 from cactus import cactus_init, cactus_complete, cactus_destroy
 from google import genai
 from google.genai import types
 
 
-def generate_cactus(messages, tools):
-    """Run function calling on-device via FunctionGemma + Cactus."""
-    model = cactus_init(functiongemma_path)
+# ── Shared model handle (avoid re-init per call) ──────────────────────
+_model = None
 
-    cactus_tools = [{
-        "type": "function",
-        "function": t,
-    } for t in tools]
+def _get_model():
+    global _model
+    if _model is None:
+        _model = cactus_init(functiongemma_path)
+    return _model
+
+
+def _cactus_call(messages, tools, force_tools=True):
+    """Single FunctionGemma call — reuses model handle."""
+    model = _get_model()
+
+    cactus_tools = [{"type": "function", "function": t} for t in tools]
 
     raw_str = cactus_complete(
         model,
         [{"role": "system", "content": "You are a helpful assistant that can use tools."}] + messages,
         tools=cactus_tools,
-        force_tools=True,
+        force_tools=force_tools,
         max_tokens=256,
         stop_sequences=["<|im_end|>", "<end_of_turn>"],
     )
 
-    cactus_destroy(model)
-
     try:
         raw = json.loads(raw_str)
     except json.JSONDecodeError:
-        return {
-            "function_calls": [],
-            "total_time_ms": 0,
-            "confidence": 0,
-        }
+        return {"function_calls": [], "total_time_ms": 0, "confidence": 0}
 
     return {
         "function_calls": raw.get("function_calls", []),
         "total_time_ms": raw.get("total_time_ms", 0),
         "confidence": raw.get("confidence", 0),
     }
+
+
+def generate_cactus(messages, tools):
+    """Run function calling on-device via FunctionGemma + Cactus."""
+    return _cactus_call(messages, tools)
 
 
 def generate_cloud(messages, tools):
@@ -94,19 +99,136 @@ def generate_cloud(messages, tools):
     }
 
 
+# ── Atomic Router: the hybrid strategy ────────────────────────────────
+
+def _is_multi_call(text):
+    """Heuristic: detect if user wants multiple actions.
+    
+    Looks for conjunctions joining action phrases.
+    """
+    # Patterns that strongly suggest multiple intents
+    multi_patterns = [
+        r'\band\b.*\b(set|send|text|check|get|play|find|look|remind|create)\b',
+        r'\b(set|send|text|check|get|play|find|look|remind|create)\b.*\band\b.*\b(set|send|text|check|get|play|find|look|remind|create)\b',
+    ]
+    for p in multi_patterns:
+        if re.search(p, text, re.IGNORECASE):
+            return True
+    return False
+
+
+def _split_into_atomic(text):
+    """Split a multi-intent request into atomic sub-requests.
+    
+    Uses simple conjunction splitting + cleanup.
+    """
+    # Split on ", and ", " and " but be smart about it
+    # First try splitting on ", and "
+    parts = re.split(r',?\s+and\s+', text, flags=re.IGNORECASE)
+    
+    # Clean up each part
+    cleaned = []
+    for part in parts:
+        part = part.strip().rstrip('.')
+        if len(part) > 5:  # skip fragments
+            cleaned.append(part)
+    
+    return cleaned if len(cleaned) > 1 else [text]
+
+
+def _validate_call(call, tools):
+    """Check if a function call is valid against the tool definitions."""
+    tool_names = {t["name"] for t in tools}
+    
+    if call.get("name") not in tool_names:
+        return False
+    
+    # Find the matching tool
+    tool = next(t for t in tools if t["name"] == call["name"])
+    required = tool["parameters"].get("required", [])
+    args = call.get("arguments", {})
+    
+    # Check required args are present
+    for req in required:
+        if req not in args:
+            return False
+        # Check for empty values
+        if isinstance(args[req], str) and not args[req].strip():
+            return False
+    
+    return True
+
+
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
-    """Baseline hybrid inference strategy; fall back to cloud if Cactus Confidence is below threshold."""
-    local = generate_cactus(messages, tools)
-
-    if local["confidence"] >= confidence_threshold:
-        local["source"] = "on-device"
-        return local
-
-    cloud = generate_cloud(messages, tools)
-    cloud["source"] = "cloud (fallback)"
-    cloud["local_confidence"] = local["confidence"]
-    cloud["total_time_ms"] += local["total_time_ms"]
-    return cloud
+    """Atomic Router: decompose → local-first → validate → fallback.
+    
+    Strategy:
+    1. Detect multi-call requests and split into atomic sub-requests
+    2. Run FunctionGemma on each atomic request independently
+    3. Validate results (correct function name, required args present)
+    4. Only fall back to cloud for failed/invalid atomic calls
+    5. Merge all results
+    """
+    user_text = ""
+    for m in messages:
+        if m["role"] == "user":
+            user_text = m["content"]
+    
+    total_time = 0
+    all_calls = []
+    used_cloud = False
+    
+    if _is_multi_call(user_text):
+        # ── MULTI-CALL PATH: Atomic decomposition ──
+        atomic_parts = _split_into_atomic(user_text)
+        
+        for part in atomic_parts:
+            sub_messages = [{"role": "user", "content": part}]
+            local = _cactus_call(sub_messages, tools)
+            total_time += local["total_time_ms"]
+            
+            # Validate local result
+            valid_calls = [c for c in local["function_calls"] if _validate_call(c, tools)]
+            
+            if valid_calls and local["confidence"] >= 0.3:
+                all_calls.extend(valid_calls)
+            else:
+                # Fallback to cloud for this atomic part only
+                cloud = generate_cloud(sub_messages, tools)
+                total_time += cloud["total_time_ms"]
+                all_calls.extend(cloud["function_calls"])
+                used_cloud = True
+    else:
+        # ── SINGLE-CALL PATH: Try local first ──
+        local = _cactus_call(messages, tools)
+        total_time += local["total_time_ms"]
+        
+        valid_calls = [c for c in local["function_calls"] if _validate_call(c, tools)]
+        
+        if valid_calls and local["confidence"] >= 0.3:
+            all_calls = valid_calls
+        else:
+            # Fallback to cloud
+            cloud = generate_cloud(messages, tools)
+            total_time += cloud["total_time_ms"]
+            all_calls = cloud["function_calls"]
+            used_cloud = True
+    
+    # Deduplicate calls (same function + same args = keep one)
+    seen = set()
+    deduped = []
+    for call in all_calls:
+        key = (call["name"], json.dumps(call.get("arguments", {}), sort_keys=True))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(call)
+    
+    return {
+        "function_calls": deduped,
+        "total_time_ms": total_time,
+        "source": "cloud (fallback)" if used_cloud else "on-device",
+        "confidence": 1.0 if not used_cloud else 0.0,
+    }
 
 
 def print_result(label, result):
@@ -153,4 +275,4 @@ if __name__ == "__main__":
     print_result("Gemini (Cloud)", cloud)
 
     hybrid = generate_hybrid(messages, tools)
-    print_result("Hybrid (On-Device + Cloud Fallback)", hybrid)
+    print_result("Hybrid Atomic Router", hybrid)
