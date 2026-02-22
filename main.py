@@ -1,14 +1,17 @@
-import sys
-sys.path.insert(0, "cactus/python/src")
+import json, os, re, sys, time
 
-import json, os, re, time
-
-# ── Cactus import with graceful fallback ─────────────────────────────
+# Try system cactus first (eval server provides its own runtime).
+# Only fall back to local path for development.
 try:
     from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_reset
     HAS_CACTUS = True
 except ImportError:
-    HAS_CACTUS = False
+    try:
+        sys.path.insert(0, "cactus/python/src")
+        from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_reset
+        HAS_CACTUS = True
+    except ImportError:
+        HAS_CACTUS = False
 
 try:
     from google import genai
@@ -17,17 +20,19 @@ try:
 except ImportError:
     HAS_GEMINI = False
 
-# Find model weights — try multiple paths
-functiongemma_path = None
-for p in [
-    "cactus/weights/functiongemma-270m-it",
-    "weights/functiongemma-270m-it",
-    os.path.expanduser("~/.cactus/weights/functiongemma-270m-it"),
-    "/tmp/functiongemma-270m-it",
-]:
-    if os.path.exists(p):
-        functiongemma_path = p
-        break
+# Find model weights — env var first (eval server), then search common paths
+functiongemma_path = os.environ.get("FUNCTIONGEMMA_PATH")
+if not functiongemma_path or not os.path.exists(functiongemma_path):
+    functiongemma_path = None
+    for p in [
+        "cactus/weights/functiongemma-270m-it",
+        "weights/functiongemma-270m-it",
+        os.path.expanduser("~/.cactus/weights/functiongemma-270m-it"),
+        "/tmp/functiongemma-270m-it",
+    ]:
+        if os.path.exists(p):
+            functiongemma_path = p
+            break
 
 
 # ── Model management ─────────────────────────────────────────────────
@@ -154,6 +159,64 @@ def _postprocess_args(call, user_text=""):
                     pass
             elif isinstance(args["minutes"], float):
                 args["minutes"] = int(args["minutes"])
+
+    # ── Postprocess args from user_text for remaining tools (from Kai's v5) ──
+    # This acts as a safety net: if the model picked the right tool but
+    # extracted bad args, regex overrides with correct values.
+    if name == "create_reminder" and user_text:
+        m = re.search(r'(?:remind\s+(?:me\s+)?(?:about|to)\s+)(.+?)\s+at\s+(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm))', user_text, re.IGNORECASE)
+        if not m:
+            m = re.search(r'(?:remind\s+(?:me\s+)?(?:about|to)\s+)(.+?)\s+at\s+(\d{1,2}\s*(?:AM|PM|am|pm))', user_text, re.IGNORECASE)
+        if m:
+            title = re.sub(r'^(the|a|an)\s+', '', m.group(1).strip(), flags=re.IGNORECASE)
+            args["title"] = title
+            time_str = m.group(2).strip().upper()
+            if ':' not in time_str:
+                time_str = re.sub(r'(\d+)\s*(AM|PM)', r'\1:00 \2', time_str)
+            args["time"] = time_str
+
+    if name == "search_contacts" and user_text:
+        m = re.search(r'(?:find|look\s*up|search)\s+(\w+)\s+(?:in\s+)?(?:my\s+)?contacts?', user_text, re.IGNORECASE)
+        if m:
+            args["query"] = m.group(1)
+
+    if name == "send_message" and user_text:
+        m = re.search(r'(?:send|text)\s+(?:a\s+)?message\s+to\s+(\w+)\s+(?:saying|that)\s+(.+?)(?:\s*(?:,\s*(?:and\s+)?(?:set|check|get|play|remind|find|look|search)\b|\s+and\s+(?:set|check|get|play|remind|find|look|search)\b|[.,!?]*$))', user_text, re.IGNORECASE)
+        if not m:
+            m = re.search(r'(?:send|text)\s+(\w+)\s+(?:a\s+)?(?:message\s+)?(?:saying|that)\s+(.+?)(?:\s*(?:,\s*(?:and\s+)?(?:set|check|get|play|remind|find|look|search)\b|\s+and\s+(?:set|check|get|play|remind|find|look|search)\b|[.,!?]*$))', user_text, re.IGNORECASE)
+        if not m:
+            m = re.search(r'(?:tell)\s+(\w+)\s+(?:that\s+|to\s+)?(.+?)(?:\s*(?:,|\s+and\s+(?:set|check|get|play|remind|find|look|search))\b|[.,!?]*$)', user_text, re.IGNORECASE)
+        if m:
+            recipient = m.group(1)
+            msg = m.group(2).strip().rstrip(".,!?")
+            # Pronoun resolution
+            if recipient.lower() in ("him", "her", "them", "he", "she", "they"):
+                proper = [w for w in re.findall(r'\b[A-Z][a-z]+\b', user_text)
+                          if w.lower() not in ("set", "send", "find", "check", "play", "remind",
+                                               "text", "look", "search", "wake", "what", "how", "tell")]
+                if proper:
+                    recipient = proper[0]
+            if recipient.lower() not in ("a", "the", "an", "my"):
+                args["recipient"] = recipient
+                args["message"] = msg
+
+    if name == "get_weather" and user_text:
+        m = re.search(r'(?:weather|forecast|temperature)\s+(?:like\s+)?(?:in|for|at)\s+(.+?)(?:\s*(?:,|\s+and\s+(?:set|send|text|play|remind|find|look|search|check|get|wake))\s*|[.,!?]*$)', user_text, re.IGNORECASE)
+        if not m:
+            m = re.search(r'\b(?:in|for|at)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)', user_text)
+        if m:
+            location = m.group(1).strip().rstrip('.,!?')
+            if location and len(location) > 1:
+                args["location"] = location
+
+    # Generic numeric string coercion for all args
+    for key, val in list(args.items()):
+        if isinstance(val, str):
+            try:
+                if val.isdigit() or (len(val) > 1 and val.startswith('-') and val[1:].isdigit()):
+                    args[key] = int(val)
+            except (ValueError, IndexError):
+                pass
 
     call["arguments"] = args
     return call
