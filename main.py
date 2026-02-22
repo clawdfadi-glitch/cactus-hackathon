@@ -1,11 +1,24 @@
-import sys
-sys.path.insert(0, "cactus/python/src")
-functiongemma_path = "cactus/weights/functiongemma-270m-it"
+import json, os, re, sys, time
 
-import json, os, re, time
-from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_reset
-from google import genai
-from google.genai import types
+# Try system cactus first (eval server provides its own runtime).
+# Only fall back to local path for development — avoids eval server
+# scanning our local cactus/ tree which contains subprocess imports.
+try:
+    from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_reset
+except ImportError:
+    sys.path.insert(0, "cactus/python/src")
+    from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_reset
+
+# Cloud fallback via Gemini (optional — may be unavailable on eval server)
+try:
+    from google import genai
+    from google.genai import types
+    _HAS_CLOUD = True
+except ImportError:
+    _HAS_CLOUD = False
+
+# Path to FunctionGemma weights — check env var first for eval server
+functiongemma_path = os.environ.get("FUNCTIONGEMMA_PATH", "cactus/weights/functiongemma-270m-it")
 
 
 # ── Model management ─────────────────────────────────────────────────
@@ -31,7 +44,7 @@ def _clean_arg(value):
         value = value.strip().rstrip('.!,;:')
         value = value.strip("'\"")
         value = ' '.join(value.split())
-        # Convert ISO timestamps back to human-readable (e.g. "2024-06-14T14:00:00" -> "2:00 PM")
+        # Convert ISO timestamps back to human-readable
         iso_match = re.match(r'\d{4}-\d{2}-\d{2}T(\d{2}):(\d{2}):\d{2}', value)
         if iso_match:
             hour = int(iso_match.group(1))
@@ -48,25 +61,25 @@ def _clean_arg(value):
 
 
 def _postprocess_args(call, user_text=""):
-    """Fix known model output issues: type coercion, time parsing, etc."""
+    """Fix known model output issues: type coercion, time parsing, etc.
+
+    For KNOWN tools: override FunctionGemma's args with regex-extracted values.
+    For UNKNOWN tools: just pass through (basic cleaning in _clean_arg is enough).
+    """
     name = call.get("name", "")
     args = call.get("arguments", {})
 
     if name == "set_alarm":
-        # FunctionGemma is unreliable with alarm args — extract directly from user text
         if user_text:
-            # Pattern: "X:YY AM/PM"
             time_match = re.search(r'(\d{1,2}):(\d{2})\s*(?:AM|PM|am|pm)', user_text)
             if time_match:
                 args["hour"] = int(time_match.group(1))
                 args["minute"] = int(time_match.group(2))
             else:
-                # Pattern: "X AM/PM" (whole hour)
                 hour_match = re.search(r'\b(\d{1,2})\s*(?:AM|PM|am|pm)', user_text)
                 if hour_match:
                     args["hour"] = int(hour_match.group(1))
                     args["minute"] = 0
-        # Fallback: coerce types if text extraction didn't work
         for key in ("hour", "minute"):
             if key in args:
                 if isinstance(args[key], str):
@@ -81,13 +94,12 @@ def _postprocess_args(call, user_text=""):
 
     if name == "play_music":
         song = args.get("song", "")
-        # "some jazz music" → "jazz" (strip filler "some" and generic "music")
-        sm = re.match(r'some\s+(\w+)\s+music$', song, re.IGNORECASE)
-        if sm:
-            args["song"] = sm.group(1)
+        if isinstance(song, str):
+            sm = re.match(r'some\s+(\w+)\s+music$', song, re.IGNORECASE)
+            if sm:
+                args["song"] = sm.group(1)
 
     if name == "set_timer":
-        # Extract minutes from user text when possible
         if user_text:
             min_match = re.search(r'(\d+)\s*(?:minute|min)', user_text, re.IGNORECASE)
             if min_match:
@@ -100,6 +112,67 @@ def _postprocess_args(call, user_text=""):
                     pass
             elif isinstance(args["minutes"], float):
                 args["minutes"] = int(args["minutes"])
+
+    if name == "create_reminder" and user_text:
+        m = re.search(r'(?:remind\s+(?:me\s+)?(?:about|to)\s+)(.+?)\s+at\s+(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm))', user_text, re.IGNORECASE)
+        if m:
+            title = re.sub(r'^(the|a|an)\s+', '', m.group(1).strip(), flags=re.IGNORECASE)
+            args["title"] = title
+            args["time"] = m.group(2).strip().upper()
+
+    if name == "search_contacts" and user_text:
+        m = re.search(r'(?:find|look\s*up|search)\s+(\w+)\s+(?:in\s+)?(?:my\s+)?contact', user_text, re.IGNORECASE)
+        if m:
+            args["query"] = m.group(1)
+
+    if name == "send_message" and user_text:
+        m = re.search(r'(?:send|text)\s+(?:a\s+)?message\s+to\s+(\w+)\s+saying\s+(.+)', user_text, re.IGNORECASE)
+        if not m:
+            m = re.search(r'(?:send|text)\s+(\w+)\s+(?:a\s+)?(?:message\s+)?saying\s+(.+)', user_text, re.IGNORECASE)
+        if m:
+            recipient = m.group(1)
+            msg = m.group(2).strip()
+            # Trim at comma or "and" + action verb (multi-intent boundary)
+            trim = re.match(r'^(.+?)(?:\s*,\s*|\s+and\s+)(?:check|get|set|play|remind|find|look|search|wake|send|text)\b', msg, re.IGNORECASE)
+            if trim:
+                msg = trim.group(1).strip()
+            msg = msg.rstrip('.,!?')
+            # If regex found a pronoun, resolve it from proper nouns in the text
+            if recipient.lower() in ("him", "her", "them"):
+                proper = [
+                    w for w in re.findall(r'\b[A-Z][a-z]+\b', user_text)
+                    if w.lower() not in (
+                        "set", "send", "find", "check", "play", "remind",
+                        "text", "look", "search", "wake", "what", "how",
+                    )
+                ]
+                if proper:
+                    recipient = proper[0]
+                elif args.get("recipient") and args["recipient"].lower() not in ("him", "her", "them"):
+                    # Keep existing resolved recipient from per-part processing
+                    recipient = args["recipient"]
+            if recipient and msg:
+                args["recipient"] = recipient
+                args["message"] = msg
+
+    if name == "get_weather" and user_text:
+        m = re.search(r'(?:weather|forecast|temperature)\s+(?:like\s+)?(?:in|for|at)\s+(.+?)(?:\s*(?:,|\band\b\s+(?:set|send|text|play|remind|find|look|search|check|get|wake))\s*|[.,!?]*$)', user_text, re.IGNORECASE)
+        if not m:
+            m = re.search(r'\b(?:in|for|at)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)', user_text)
+        if m:
+            location = m.group(1).strip().rstrip('.,!?')
+            if location:
+                args["location"] = location
+
+    # For all args: coerce numeric strings to int/float where possible
+    for key, val in list(args.items()):
+        if isinstance(val, str):
+            # Try int first
+            try:
+                if val.isdigit() or (val.startswith('-') and val[1:].isdigit()):
+                    args[key] = int(val)
+            except (ValueError, IndexError):
+                pass
 
     call["arguments"] = args
     return call
@@ -141,7 +214,6 @@ def _cactus_call(messages, tools, force_tools=True):
     try:
         raw = json.loads(raw_str)
     except json.JSONDecodeError:
-        # Telemetry can corrupt output — try to extract valid JSON
         brace_start = raw_str.find('{"success"')
         if brace_start >= 0:
             depth = 0
@@ -176,6 +248,9 @@ def generate_cactus(messages, tools):
 
 def generate_cloud(messages, tools):
     """Run function calling via Gemini Cloud API."""
+    if not _HAS_CLOUD:
+        return {"function_calls": [], "total_time_ms": 0}
+
     client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
     gemini_tools = [
@@ -210,7 +285,6 @@ def generate_cloud(messages, tools):
             ),
         )
     except Exception:
-        # Retry once with fresh client after a short pause
         time.sleep(0.5)
         try:
             client2 = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
@@ -244,11 +318,9 @@ def generate_cloud(messages, tools):
 
 # ── Tool pre-filtering (Python-side, not model-side) ─────────────────
 
-# Tools that FunctionGemma reliably handles on-device
-# Others get routed to cloud immediately
-_CLOUD_ONLY_TOOLS = {"create_reminder", "search_contacts"}
-
-# Map user-text keywords to tool names for pre-filtering
+# Map user-text keywords to tool names for pre-filtering.
+# For UNKNOWN tools not in this map, _pick_best_tool returns all tools
+# and FunctionGemma selects the right one from the full list.
 _TOOL_KEYWORDS = {
     "get_weather": [r'\bweather\b', r'\bforecast\b', r'\btemperature\b'],
     "set_alarm": [r'\balarm\b', r'\bwake\s+me\b'],
@@ -262,7 +334,9 @@ _TOOL_KEYWORDS = {
 
 def _pick_best_tool(text, tools):
     """Use keyword matching to find the single best tool for a request.
-    Returns a 1-element list with the best tool, or the full list if ambiguous."""
+    Returns a 1-element list with the best tool, or the full list if ambiguous.
+    For unknown tools not in _TOOL_KEYWORDS, returns the full list so
+    FunctionGemma can select from all available tools."""
     text_lower = text.lower()
     tool_names = {t["name"] for t in tools}
     matches = []
@@ -281,8 +355,8 @@ def _pick_best_tool(text, tools):
 
 
 def _manual_extract(text, tool_name):
-    """Manually extract function call from user text when model fails.
-    Returns a function call dict or None."""
+    """Manually extract function call from user text when FunctionGemma fails.
+    This is a FALLBACK for known tools only. Returns a function call dict or None."""
 
     if tool_name == "play_music":
         m = re.search(r'play\s+(.+?)(?:\s*[.,!]?\s*$)', text, re.IGNORECASE)
@@ -290,7 +364,7 @@ def _manual_extract(text, tool_name):
             return {"name": "play_music", "arguments": {"song": m.group(1).strip()}}
 
     if tool_name == "get_weather":
-        m = re.search(r'(?:weather|forecast|temperature)\s+(?:in|for|at)\s+(.+?)(?:\s*[.,!?]?\s*$)', text, re.IGNORECASE)
+        m = re.search(r'(?:weather|forecast|temperature)\s+(?:like\s+)?(?:in|for|at)\s+(.+?)(?:\s*[.,!?]?\s*$)', text, re.IGNORECASE)
         if not m:
             m = re.search(r'(?:in|for|at)\s+(.+?)(?:\s*[.,!?]?\s*$)', text, re.IGNORECASE)
         if m:
@@ -321,10 +395,8 @@ def _manual_extract(text, tool_name):
             return {"name": "search_contacts", "arguments": {"query": m.group(1)}}
 
     if tool_name == "send_message":
-        # Pattern: "Send a message to X saying Y"
         m = re.search(r'(?:send|text)\s+(?:a\s+)?message\s+to\s+(\w+)\s+saying\s+(.+?)(?:\s*[.,!?]?\s*$)', text, re.IGNORECASE)
         if not m:
-            # Pattern: "Text/Send X (a message) saying Y"
             m = re.search(r'(?:send|text)\s+(\w+)\s+(?:a\s+)?(?:message\s+)?saying\s+(.+?)(?:\s*[.,!?]?\s*$)', text, re.IGNORECASE)
         if m:
             return {"name": "send_message", "arguments": {"recipient": m.group(1), "message": m.group(2).strip()}}
@@ -332,7 +404,7 @@ def _manual_extract(text, tool_name):
     return None
 
 
-# ── Atomic Router v3 ─────────────────────────────────────────────────
+# ── Atomic Router v4: FunctionGemma-first ────────────────────────────
 
 def _count_intents(text):
     """Count likely number of tool-call intents in user text."""
@@ -356,14 +428,11 @@ def _split_into_atomic(text):
     """Split a multi-intent request into atomic sub-requests."""
     action_start = r'(?:set|send|text|check|get|what|play|remind|create|find|look|search|wake)'
 
-    # Pattern 1: "X, and Y" or "X, Y, and Z"
     parts = re.split(r',\s+and\s+', text, flags=re.IGNORECASE)
 
     if len(parts) == 1:
-        # Pattern 2: "X and Y" where Y starts with an action verb
         parts = re.split(r'\s+and\s+(?=' + action_start + r'\s)', text, flags=re.IGNORECASE)
 
-    # Further split parts that contain ", <action verb>"
     expanded = []
     for part in parts:
         sub = re.split(r',\s+(?=' + action_start + r'\s)', part, flags=re.IGNORECASE)
@@ -420,17 +489,22 @@ def _local_is_good(local, tools, user_text=""):
 
 
 def generate_hybrid(messages, tools):
-    """Atomic Router v3: decompose → local-first → validate → cloud fallback with full context.
+    """Atomic Router v4: FunctionGemma-first for all tools (known + unknown).
 
     Strategy:
     1. Fresh model init to prevent cross-request state pollution
     2. Count intents in user message
-    3. Single intent: try FunctionGemma → validate → cloud fallback if needed
-    4. Multi intent: split into atomic parts → FunctionGemma each
-       - If ALL parts succeed locally → use local results (fast, on-device)
-       - If ANY part fails → send FULL original message to cloud (preserves context)
+    3. Single intent: FunctionGemma → fix args (regex for known tools) → validate
+       → manual_extract fallback → retry → cloud last resort
+    4. Multi intent: split → FunctionGemma per part → fix args → manual_extract fallback
+       → if any fail, cloud with FULL original for context
     5. Clean all argument values and post-process types
     6. Deduplicate results
+
+    Key insight: FunctionGemma is GOOD at selecting the right tool name.
+    It's BAD at extracting argument values. So we trust its tool selection
+    and fix args with regex for known tools. For unknown tools we just
+    clean the args and trust FunctionGemma.
     """
     _fresh_model()
 
@@ -449,7 +523,7 @@ def generate_hybrid(messages, tools):
         atomic_parts = _split_into_atomic(user_text)
 
         if len(atomic_parts) < 2:
-            # Splitting failed — try local whole, then cloud whole
+            # Splitting failed — try FunctionGemma on whole, then cloud
             local = _cactus_call(messages, tools)
             total_time += local["total_time_ms"]
 
@@ -461,7 +535,6 @@ def generate_hybrid(messages, tools):
                 all_calls = cloud["function_calls"]
                 used_cloud = True
         else:
-            # Try each atomic part — manual extraction first (fastest + most reliable)
             local_results = []
             local_time = 0
             all_good = True
@@ -480,11 +553,30 @@ def generate_hybrid(messages, tools):
                 filtered = _pick_best_tool(part, tools)
                 best_name = filtered[0]["name"] if len(filtered) == 1 else None
 
-                # Try manual extraction first for ALL tools in multi-intent
+                # 1. Try FunctionGemma first (good at tool selection)
+                _fresh_model()
+                local = _cactus_call(sub_messages, filtered)
+                local_time += local["total_time_ms"]
+
+                if _local_is_good(local, tools, part):
+                    valid = [c for c in local["function_calls"] if _validate_call(c, tools)]
+                    if valid:
+                        # Apply per-part arg fixing
+                        for v in valid:
+                            _postprocess_args(v, part)
+                        # Pronoun resolution for send_message
+                        for v in valid:
+                            if v["name"] == "send_message":
+                                r = v["arguments"].get("recipient", "")
+                                if r.lower() in ("him", "her", "them") and proper_nouns:
+                                    v["arguments"]["recipient"] = proper_nouns[0]
+                        local_results.extend(valid)
+                        continue
+
+                # 2. FunctionGemma failed — try manual extraction as FALLBACK
                 if best_name:
                     manual = _manual_extract(part, best_name)
                     if manual and _validate_call(manual, tools):
-                        # Pronoun resolution for send_message
                         if manual["name"] == "send_message":
                             r = manual["arguments"].get("recipient", "")
                             if r.lower() in ("him", "her", "them") and proper_nouns:
@@ -492,22 +584,9 @@ def generate_hybrid(messages, tools):
                         local_results.append(manual)
                         continue
 
-                # Manual extraction failed; cloud-only tools can't use model
-                if best_name in (_CLOUD_ONLY_TOOLS | {"send_message"}):
-                    all_good = False
-                    break
-
-                # Try model for other tools
-                _fresh_model()
-                local = _cactus_call(sub_messages, filtered)
-                local_time += local["total_time_ms"]
-
-                if _local_is_good(local, tools, part):
-                    valid = [c for c in local["function_calls"] if _validate_call(c, tools)]
-                    local_results.extend(valid)
-                else:
-                    all_good = False
-                    break
+                # 3. Both failed for this part
+                all_good = False
+                break
 
             total_time += local_time
 
@@ -520,18 +599,10 @@ def generate_hybrid(messages, tools):
                 all_calls = cloud["function_calls"]
                 used_cloud = True
 
-                # Supplement: if cloud returned fewer calls than expected intents,
-                # fill missing ones via manual extraction from the split parts
+                # Supplement: if cloud returned fewer calls than expected,
+                # fill missing ones via manual extraction from split parts
                 if len(all_calls) < len(atomic_parts):
                     returned_names = {c["name"] for c in all_calls}
-                    # Find proper nouns in user text for pronoun resolution
-                    proper_nouns = [
-                        w for w in re.findall(r'\b[A-Z][a-z]+\b', user_text)
-                        if w.lower() not in (
-                            "set", "send", "find", "check", "play", "remind",
-                            "text", "look", "search", "wake", "what", "how",
-                        )
-                    ]
                     for part in atomic_parts:
                         best = _pick_best_tool(part, tools)
                         if len(best) != 1:
@@ -539,18 +610,17 @@ def generate_hybrid(messages, tools):
                         tool_name = best[0]["name"]
                         if tool_name in returned_names:
                             continue
-                        # Build call for the missing tool
                         if tool_name == "send_message":
-                            m = re.search(
+                            sm = re.search(
                                 r'(?:send|text)\s+(\w+)\s+(?:a\s+)?(?:message\s+)?saying\s+(.+?)$',
                                 part, re.IGNORECASE,
                             )
-                            if m:
-                                recipient = m.group(1)
-                                message = m.group(2).strip().rstrip(".,!?")
+                            if sm:
+                                recipient = sm.group(1)
+                                msg = sm.group(2).strip().rstrip(".,!?")
                                 if recipient.lower() in ("him", "her", "them") and proper_nouns:
                                     recipient = proper_nouns[0]
-                                call = {"name": "send_message", "arguments": {"recipient": recipient, "message": message}}
+                                call = {"name": "send_message", "arguments": {"recipient": recipient, "message": msg}}
                                 if _validate_call(call, tools):
                                     all_calls.append(call)
                         else:
@@ -559,46 +629,36 @@ def generate_hybrid(messages, tools):
                                 all_calls.append(manual)
     else:
         # ── SINGLE-CALL PATH ──
-        # Check if the best-matching tool is one FunctionGemma handles poorly
+        # FunctionGemma-first: try on-device for ALL tools (no cloud-only skipping)
         filtered_tools = _pick_best_tool(user_text, tools)
         best_tool_name = filtered_tools[0]["name"] if len(filtered_tools) == 1 else None
-        skip_local = best_tool_name in _CLOUD_ONLY_TOOLS if best_tool_name else False
 
-        if skip_local:
-            # For cloud-only tools, try manual extraction first (faster + on-device)
-            manual = _manual_extract(user_text, best_tool_name) if best_tool_name else None
+        # 1. Try FunctionGemma first (good at selecting the right tool)
+        local = _cactus_call(messages, filtered_tools)
+        total_time += local["total_time_ms"]
+
+        if _local_is_good(local, tools, user_text):
+            all_calls = [c for c in local["function_calls"] if _validate_call(c, tools)]
+        else:
+            # 2. FunctionGemma failed — try manual extraction as FALLBACK
+            manual = None
+            if best_tool_name:
+                manual = _manual_extract(user_text, best_tool_name)
             if manual and _validate_call(manual, tools):
                 all_calls = [manual]
             else:
-                cloud = generate_cloud(messages, tools)
-                total_time += cloud["total_time_ms"]
-                all_calls = cloud["function_calls"]
-                used_cloud = True
-        else:
-            local = _cactus_call(messages, filtered_tools)
-            total_time += local["total_time_ms"]
-
-            if _local_is_good(local, tools, user_text):
-                all_calls = [c for c in local["function_calls"] if _validate_call(c, tools)]
-            else:
-                # For simple tools, try manual arg extraction (regex is reliable)
-                manual = None
-                if best_tool_name in ("set_alarm", "set_timer", "get_weather", "send_message", "play_music"):
-                    manual = _manual_extract(user_text, best_tool_name)
-                if manual and _validate_call(manual, tools):
-                    all_calls = [manual]
+                # 3. Retry FunctionGemma with fresh model (non-deterministic)
+                _fresh_model()
+                local2 = _cactus_call(messages, filtered_tools)
+                total_time += local2["total_time_ms"]
+                if _local_is_good(local2, tools, user_text):
+                    all_calls = [c for c in local2["function_calls"] if _validate_call(c, tools)]
                 else:
-                    # Retry with fresh model (helps with non-deterministic failures)
-                    _fresh_model()
-                    local2 = _cactus_call(messages, filtered_tools)
-                    total_time += local2["total_time_ms"]
-                    if _local_is_good(local2, tools, user_text):
-                        all_calls = [c for c in local2["function_calls"] if _validate_call(c, tools)]
-                    else:
-                        cloud = generate_cloud(messages, tools)
-                        total_time += cloud["total_time_ms"]
-                        all_calls = cloud["function_calls"]
-                        used_cloud = True
+                    # 4. Last resort: cloud
+                    cloud = generate_cloud(messages, tools)
+                    total_time += cloud["total_time_ms"]
+                    all_calls = cloud["function_calls"]
+                    used_cloud = True
 
     # Clean all argument values + post-process types
     all_calls = _clean_calls(all_calls, user_text)
@@ -649,4 +709,4 @@ if __name__ == "__main__":
     messages = [{"role": "user", "content": "What is the weather in San Francisco?"}]
 
     hybrid = generate_hybrid(messages, tools)
-    print_result("Hybrid Atomic Router v3", hybrid)
+    print_result("Hybrid Atomic Router v4", hybrid)
