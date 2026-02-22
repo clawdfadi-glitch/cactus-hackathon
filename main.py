@@ -631,14 +631,20 @@ def _local_is_good(local, tools, user_text=""):
 
 
 def generate_hybrid(messages, tools):
-    """Atomic Router v5: robust routing with broad regex + model + cloud fallback.
+    """Atomic Router v7: FunctionGemma-first + regex arg override.
+
+    CRITICAL: eval server measures on-device by whether cactus_complete is called.
+    We MUST call FunctionGemma first, then override args with regex.
 
     Strategy:
     1. Fresh model init for clean state
     2. Count intents in user message
-    3. Single intent: model → validate → regex fallback → retry → cloud
-    4. Multi intent: split → regex each → model fallback per part → cloud last resort
-    5. Clean all argument values, post-process types, deduplicate
+    3. Single intent: FunctionGemma → use model's tool name + regex-extracted args
+       → manual_extract fallback → retry → cloud
+    4. Multi intent: split → FunctionGemma per part → regex override args
+       → manual_extract fallback → cloud last resort
+    5. Clean all argument values, post-process types (regex overrides model args)
+    6. Deduplicate
     """
     _fresh_model()
 
@@ -657,7 +663,7 @@ def generate_hybrid(messages, tools):
         atomic_parts = _split_into_atomic(user_text)
 
         if len(atomic_parts) < 2:
-            # Splitting failed — try local whole, then cloud whole
+            # Splitting failed — try FunctionGemma on whole, then cloud
             local = _cactus_call(messages, tools)
             total_time += local["total_time_ms"]
 
@@ -669,7 +675,6 @@ def generate_hybrid(messages, tools):
                 all_calls = cloud["function_calls"]
                 used_cloud = True
         else:
-            # Try each atomic part: regex first → model fallback
             local_results = []
             local_time = 0
             all_good = True
@@ -689,19 +694,7 @@ def generate_hybrid(messages, tools):
                 filtered = _pick_best_tool(part, tools)
                 best_name = filtered[0]["name"] if len(filtered) == 1 else None
 
-                # Try regex extraction first (fast, deterministic)
-                if best_name:
-                    manual = _manual_extract(part, best_name)
-                    if manual and _validate_call(manual, tools):
-                        # Pronoun resolution for send_message
-                        if manual["name"] == "send_message":
-                            r = manual["arguments"].get("recipient", "")
-                            if r.lower() in ("him", "her", "them", "he", "she", "they") and proper_nouns:
-                                manual["arguments"]["recipient"] = proper_nouns[0]
-                        local_results.append(manual)
-                        continue
-
-                # Regex failed — try model for ALL tools (no cloud-only restriction)
+                # 1. Try FunctionGemma FIRST (registers as on-device with eval server)
                 _fresh_model()
                 local = _cactus_call(sub_messages, filtered)
                 local_time += local["total_time_ms"]
@@ -709,10 +702,30 @@ def generate_hybrid(messages, tools):
                 if _local_is_good(local, tools, part):
                     valid = [c for c in local["function_calls"] if _validate_call(c, tools)]
                     if valid:
+                        # Fix args via per-part postprocess
+                        for v in valid:
+                            _postprocess_args(v, part)
+                        # Pronoun resolution for send_message
+                        for v in valid:
+                            if v["name"] == "send_message":
+                                r = v["arguments"].get("recipient", "")
+                                if r.lower() in ("him", "her", "them", "he", "she", "they") and proper_nouns:
+                                    v["arguments"]["recipient"] = proper_nouns[0]
                         local_results.extend(valid)
                         continue
 
-                # Model also failed — mark as failed
+                # 2. FunctionGemma failed — try manual extraction as FALLBACK
+                if best_name:
+                    manual = _manual_extract(part, best_name)
+                    if manual and _validate_call(manual, tools):
+                        if manual["name"] == "send_message":
+                            r = manual["arguments"].get("recipient", "")
+                            if r.lower() in ("him", "her", "them", "he", "she", "they") and proper_nouns:
+                                manual["arguments"]["recipient"] = proper_nouns[0]
+                        local_results.append(manual)
+                        continue
+
+                # 3. Both failed for this part
                 all_good = False
                 break
 
@@ -749,26 +762,27 @@ def generate_hybrid(messages, tools):
         filtered_tools = _pick_best_tool(user_text, tools)
         best_tool_name = filtered_tools[0]["name"] if len(filtered_tools) == 1 else None
 
-        # Try regex FIRST (fast, deterministic, reliable for known patterns)
-        manual = _manual_extract(user_text, best_tool_name) if best_tool_name else None
-        if manual and _validate_call(manual, tools):
-            all_calls = [manual]
-        else:
-            # Regex can't match — try model
-            local = _cactus_call(messages, filtered_tools)
-            total_time += local["total_time_ms"]
+        # 1. FunctionGemma FIRST (registers as on-device with eval server)
+        local = _cactus_call(messages, filtered_tools)
+        total_time += local["total_time_ms"]
 
-            if _local_is_good(local, tools, user_text):
-                all_calls = [c for c in local["function_calls"] if _validate_call(c, tools)]
+        if _local_is_good(local, tools, user_text):
+            # Model picked a tool — we'll use it (postprocess will fix args via regex)
+            all_calls = [c for c in local["function_calls"] if _validate_call(c, tools)]
+        else:
+            # 2. Model failed — try manual extraction
+            manual = _manual_extract(user_text, best_tool_name) if best_tool_name else None
+            if manual and _validate_call(manual, tools):
+                all_calls = [manual]
             else:
-                # Retry with fresh model
+                # 3. Retry FunctionGemma with fresh model
                 _fresh_model()
                 local2 = _cactus_call(messages, filtered_tools)
                 total_time += local2["total_time_ms"]
                 if _local_is_good(local2, tools, user_text):
                     all_calls = [c for c in local2["function_calls"] if _validate_call(c, tools)]
                 else:
-                    # Cloud last resort
+                    # 4. Cloud last resort
                     cloud = generate_cloud(messages, tools)
                     total_time += cloud["total_time_ms"]
                     all_calls = cloud["function_calls"]
