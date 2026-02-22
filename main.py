@@ -115,7 +115,7 @@ def _postprocess_args(call, user_text=""):
     if name == "play_music":
         # Always extract song from user text — model values can be wrong
         if user_text:
-            song_match = re.search(r'(?:play|put\s+on|listen\s+to)\s+(.+?)(?:\s*(?:,\s*and\b|\s+and\s+(?:set|send|text|check|get|remind|create|find|look|search|wake|tell|put|listen|message)\b|[.,!?]\s*$))', user_text, re.IGNORECASE)
+            song_match = re.search(r'(?:play|put\s+on|listen\s+to)\s+(.+?)(?:\s*(?:,\s*(?:and\s+)?(?:set|send|text|check|get|remind|create|find|look|search|wake|tell|put|listen|message)\b|,\s*and\b|\s+and\s+(?:set|send|text|check|get|remind|create|find|look|search|wake|tell|put|listen|message)\b|[.,!?]\s*$))', user_text, re.IGNORECASE)
             if not song_match:
                 # Simpler fallback: grab until end
                 song_match = re.search(r'(?:play|put\s+on|listen\s+to)\s+(.+?)(?:\s*[.,!?]?\s*$)', user_text, re.IGNORECASE)
@@ -352,8 +352,13 @@ def _manual_extract(text, tool_name):
         m = re.search(r'(?:play|put\s+on|listen\s+to)\s+(.+?)(?:\s*[.,!]?\s*$)', text, re.IGNORECASE)
         if m:
             song = m.group(1).strip()
-            # Strip leading "some" filler: "some jazz" → "jazz"
-            song = re.sub(r'^some\s+', '', song, flags=re.IGNORECASE)
+            # Strip "some X music" → "X"
+            sm = re.match(r'some\s+(.+?)\s+music$', song, re.IGNORECASE)
+            if sm:
+                song = sm.group(1)
+            else:
+                # Strip leading "some" filler: "some jazz" → "jazz"
+                song = re.sub(r'^some\s+', '', song, flags=re.IGNORECASE)
             return {"name": "play_music", "arguments": {"song": song}}
 
     if tool_name == "get_weather":
